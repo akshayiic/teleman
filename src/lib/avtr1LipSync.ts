@@ -1,20 +1,24 @@
 /**
  * Drives an AVTR-1 face (on the GPU machine, via /api/avtr1/render) from a live
  * audio track, e.g. a call's AI assistant (optionally pitch-shifted, e.g. to give a
- * man's face a deeper voice): the audio is cut into 0.6 s pieces, each
- * rendered in order (one session, so the motion flows on), and each piece is
- * played only once its frames are there, so voice and lips always match; frames
- * are drawn on the audio clock. Only speech is rendered: silent pieces show an idle
- * face loop instead, which keeps the GPU free for other calls (a call's AI usually
- * speaks well under half the time); while the voice runs late, silent pieces aren't
- * played either, which catches up. The whole call keeps one background frame and
+ * man's face a deeper voice): the audio is cut into 0.4 s pieces, each
+ * rendered in order (one session, so the motion flows on). Each piece's voice plays
+ * at a fixed short delay while its frames stream in, drawn on the audio clock; the
+ * voice never waits for the face, so it never stutters and the delay never grows (a
+ * piece whose frames come too late plays over the idle face). Only speech is rendered:
+ * silent pieces show an idle face loop instead, which keeps the GPU free for other
+ * calls (a call's AI usually speaks well under half the time); if the voice drifts
+ * late, silent pieces are cut to catch up. The whole call keeps one background frame and
  * only a soft-edged face patch changes, so lighting and grain stay perfectly steady.
  */
 
-const CHUNK_S = 0.6; // a multiple of the bridge's 0.2 s render step; shorter = less delay, more requests
-const MAX_LAG_S = 1.5; // beyond this delay (render + transfer), silent pieces are dropped to catch up
+const CHUNK_S = 0.4; // a multiple of the bridge's 0.2 s render step; shorter = less delay, more requests
+// The voice plays this long after a piece is heard, always: the face's frames stream in during
+// that time. A piece whose frames are late plays its voice over the idle face rather than
+// holding the voice back, so the voice never stutters and the delay never grows.
+const DELAY_S = 0.8;
 const SILENCE_RMS = 0.004; // quieter pieces count as silence
-const IN_FLIGHT = 2; // renders sent ahead, so the network round trip overlaps the GPU work
+const IN_FLIGHT = 1; // one render at a time, so pieces render in order and the motion flows on
 const FPS = 25;
 const BRIDGE_RATE = 16000;
 
@@ -69,9 +73,8 @@ type Piece = {
   heardAt: number; // play-context time when the piece was complete
   start: number; // play-context time it plays from; -1 until scheduled
   audio: AudioBuffer;
-  patches: Patch[];
+  patches: Patch[]; // filled while the frames stream in
   silent: boolean;
-  skipped: boolean; // not rendered: the idle face loop shows instead
 };
 
 export class Avtr1LipSync {
@@ -80,14 +83,19 @@ export class Avtr1LipSync {
   private element: HTMLAudioElement | null = null;
   private pieces: Piece[] = []; // scheduled, in play order
   private nextAt = 0; // play-context time where the next piece can start
-  private renders = Promise.resolve(); // one render at a time, in order
   private pending = 0; // renders queued or running
   private inFlight = 0;
   private waiting: (() => void)[] = []; // FIFO, so requests go out in piece order
-  /** For a debug view: loudness of the latest piece, pieces heard / skipped / dropped, renders waiting, lag in s. */
-  stats = { level: 0, pieces: 0, skipped: 0, dropped: 0, backlog: 0, lag: 0 };
+  /**
+   * For a debug view: loudness of the latest piece, pieces heard / silent (not rendered) /
+   * dropped (silence cut to catch up), late (speech whose frames missed their time), renders
+   * waiting, delay in s, and how long the latest render took.
+   */
+  stats = { level: 0, pieces: 0, skipped: 0, dropped: 0, late: 0, backlog: 0, lag: 0, renderS: 0 };
   private session = crypto.randomUUID();
   private stopped = false;
+  private aborter = new AbortController(); // cancels in-flight renders on stop()
+  private lastError = 0; // performance.now() of the last error shown, so errors aren't repeated every piece
   private timer = 0;
   // One background frame for the whole call, so lighting and grain never change; only the
   // face patch on top of it moves, from the idle loop or from speech.
@@ -107,14 +115,14 @@ export class Avtr1LipSync {
   ) {}
 
   async start(track: MediaStreamTrack) {
+    this.release(); // before the element below: release() detaches the element
     const stream = new MediaStream([track]);
     // Chrome only delivers a remote WebRTC track to Web Audio once a media element plays it.
     this.element = new Audio();
     this.element.srcObject = stream;
-    this.element.muted = true;
+    this.element.volume = 0; // silent, but playing (a muted element may not count)
     void this.element.play().catch(() => {});
 
-    this.release();
     this.play = new AudioContext();
     this.capture = new AudioContext({ sampleRate: this.play.sampleRate });
     await this.capture.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "text/javascript" })));
@@ -151,6 +159,7 @@ export class Avtr1LipSync {
 
   stop() {
     this.stopped = true;
+    this.aborter.abort();
     clearInterval(this.timer);
     this.release();
     this.idle.forEach((f) => f.img.close());
@@ -181,26 +190,38 @@ export class Avtr1LipSync {
       audio: play.createBuffer(1, samples.length, play.sampleRate),
       patches: [],
       silent: level < SILENCE_RMS,
-      skipped: false,
     };
-    // Silence shows the idle face loop; the GPU only renders speech.
-    piece.skipped = piece.silent;
     piece.audio.copyToChannel(samples, 0);
-    this.stats = { ...this.stats, level, pieces: this.stats.pieces + 1, skipped: this.stats.skipped + +piece.skipped, backlog: this.pending };
+    this.stats = { ...this.stats, level, pieces: this.stats.pieces + 1, skipped: this.stats.skipped + +piece.silent };
+    // The voice is scheduled right away, at a fixed delay: it never waits for the face.
+    if (!this.schedule(piece) || piece.silent) return; // silence shows the idle face loop: no GPU work
 
-    const pcm = piece.skipped ? null : toPcm16k(samples, play.sampleRate);
+    // The frames are useful until the piece has finished playing; after that the render is cancelled.
+    const endsIn = piece.start + piece.audio.duration - play.currentTime;
+    const deadline = performance.now() + endsIn * 1000;
+    const pcm = toPcm16k(samples, play.sampleRate);
     this.pending++;
-    const rendered = pcm
-      ? this.limited(() => this.render(pcm, piece.patches, { session: this.session, key: false })).catch((err) => {
-          piece.skipped = true;
-          this.onError(String(err.message ?? err));
-        })
-      : null;
-    // Up to IN_FLIGHT renders run at once, but pieces are scheduled strictly in order.
-    this.renders = this.renders
-      .then(() => rendered)
-      .then(() => this.schedule(piece))
-      .finally(() => this.pending--);
+    this.stats.backlog = this.pending;
+    void this.limited(async () => {
+      const wait = deadline - performance.now() - 50;
+      if (wait <= 0) throw Object.assign(new Error("late"), { name: "TimeoutError" });
+      const t = performance.now();
+      await this.render(pcm, piece.patches, { session: this.session, key: false, timeout: wait });
+      this.stats.renderS = (performance.now() - t) / 1000;
+    })
+      .catch((err) => {
+        if (this.stopped) return;
+        if (err.name === "TimeoutError" || err.name === "AbortError") {
+          this.stats.late++; // its voice played over the idle face
+          return;
+        }
+        if (performance.now() - this.lastError > 5000) this.onError(String(err.message ?? err));
+        this.lastError = performance.now();
+      })
+      .finally(() => {
+        this.pending--;
+        this.stats.backlog = this.pending;
+      });
   }
 
   private async limited(task: () => Promise<void>) {
@@ -214,18 +235,19 @@ export class Avtr1LipSync {
     }
   }
 
-  /** Plays a piece right after the previous one, once its frames are there (pieces arrive in order). */
+  /**
+   * Plays a piece DELAY_S after it was heard, right after the previous one. Returns false if
+   * it was dropped: silence, when the voice has drifted late, is cut to catch up.
+   */
   private schedule(piece: Piece) {
-    if (this.stopped || !this.play) return;
+    if (this.stopped || !this.play) return false;
     const play = this.play;
-    const start = Math.max(this.nextAt, play.currentTime + 0.05);
+    const start = Math.max(this.nextAt, piece.heardAt + DELAY_S, play.currentTime + 0.05);
     const lag = start - piece.heardAt;
     this.stats.lag = lag;
-    if (piece.silent && lag > MAX_LAG_S) {
-      // Running late: drop a piece of silence to catch up.
-      piece.patches.forEach((f) => f.img.close());
+    if (piece.silent && lag > DELAY_S + 0.3) {
       this.stats.dropped++;
-      return;
+      return false;
     }
     piece.start = start;
     this.nextAt = start + piece.audio.duration;
@@ -234,6 +256,7 @@ export class Avtr1LipSync {
     node.buffer = piece.audio;
     node.connect(play.destination);
     node.start(start);
+    return true;
   }
 
   /**
@@ -241,10 +264,19 @@ export class Avtr1LipSync {
    * frame comes whole and becomes the background (bridge protocol: 1 byte type + 4 byte
    * big-endian length + payload; 'K' full JPEG, 'P' x, y (2+2 bytes) + JPEG patch, 'E' end).
    */
-  private async render(pcm: Int16Array, out: Patch[], { session, key }: { session: string; key: boolean }) {
+  private async render(
+    pcm: Int16Array,
+    out: Patch[],
+    { session, key, timeout }: { session: string; key: boolean; timeout?: number }
+  ) {
     if (this.stopped) return;
     const query = `avatar=${encodeURIComponent(this.avatar)}&session=${session}&patch=1&key=${key ? 1 : 0}`;
-    const res = await fetch(`/api/avtr1/render?${query}`, { method: "POST", body: pcm.buffer as ArrayBuffer });
+    const res = await fetch(`/api/avtr1/render?${query}`, {
+      method: "POST",
+      body: pcm.buffer as ArrayBuffer,
+      // Frames that would come after their voice has played are of no use: give up then.
+      signal: timeout ? AbortSignal.any([this.aborter.signal, AbortSignal.timeout(timeout)]) : this.aborter.signal,
+    });
     if (!res.ok || !res.body) throw new Error((await res.json().catch(() => ({}))).error ?? `AVTR-1 render failed (${res.status})`);
     const reader = res.body.getReader();
     let buf = new Uint8Array(0);
@@ -292,7 +324,8 @@ export class Avtr1LipSync {
     }
     const piece = this.pieces[0];
     let patch: Patch | undefined;
-    if (piece && now >= piece.start && !piece.skipped) {
+    if (piece && now >= piece.start && piece.patches.length) {
+      // Frames stream in: if the one due hasn't arrived yet, hold the latest for a moment.
       patch = piece.patches[Math.min(piece.patches.length - 1, Math.floor((now - piece.start) * FPS))];
     }
     if (!patch) {

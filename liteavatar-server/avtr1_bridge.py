@@ -30,6 +30,9 @@ default: the renderer's first), BRIDGE_PORT (default 8770).
 
 import json
 import os
+import queue
+import select
+import socket
 import struct
 import tempfile
 import threading
@@ -54,6 +57,7 @@ JPEG_QUALITY = 75  # ~115 KB per 720p frame; live lip sync streams 25 a second
 sessions = {}  # session id -> (state blob, last used); motion continues across sentences
 sessions_lock = threading.Lock()
 render_lock = threading.Lock()  # one GPU, one stream at a time
+renderer_time = threading.local()  # seconds spent waiting on the renderer, for the log
 idle_clips = {}
 face_boxes = {}  # avatar -> (x, y, w, h) of the region AVTR-1 changes, for patch=1
 PATCH_QUALITY = 90
@@ -62,6 +66,16 @@ KEY_QUALITY = 92  # the background a client may keep for a whole call
 
 def log(*args):
     print(time.strftime("%H:%M:%S"), *args, flush=True)
+
+
+def client_gone(sock):
+    """True if the client has closed its side (its request was fully read already)."""
+    try:
+        if not select.select([sock], [], [], 0)[0]:
+            return False
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except OSError:
+        return True
 
 
 def renderer_get(path):
@@ -102,6 +116,7 @@ def render_chunk(avatar, bg, cur, fut, state):
     body, ctype = multipart(fields)
     query = f"avatar_id={urllib.request.quote(avatar)}&bg_id={urllib.request.quote(bg)}&pixel_format=yuv_i420"
     req = urllib.request.Request(f"{RENDERER}/process-audio-v3?{query}", body, {"Content-Type": ctype})
+    t = time.time()
     try:
         r = urllib.request.urlopen(req, timeout=60)
     except urllib.error.HTTPError as e:
@@ -110,6 +125,7 @@ def render_chunk(avatar, bg, cur, fut, state):
         state_len = int(r.headers["X-State-Length-Bytes"])
         h, w = int(r.headers["X-Frame-Height"]), int(r.headers["X-Frame-Width"])
         data = r.read()
+    renderer_time.value = getattr(renderer_time, "value", 0.0) + time.time() - t
     size = h * w * 3 // 2
     frames = []
     for i in range((len(data) - state_len) // size):
@@ -218,6 +234,8 @@ class Handler(BaseHTTPRequestHandler):
             want_key = q.get("key", ["1"])[0] != "0"
         except Exception as e:
             return self.send_json(502, {"error": f"AVTR-1: {e}"})
+        # A client that stops reading must not hold render_lock forever: give up on it after 15 s.
+        self.connection.settimeout(15)
         pcm = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         pcm = pcm[: len(pcm) // 2 * 2]
 
@@ -231,50 +249,77 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(f"{len(msg):x}\r\n".encode() + msg + b"\r\n")
             self.wfile.flush()
 
-        error = None
         t = time.time()
-        n = 0
-        with render_lock:
-            # Read the motion state only once it's our turn: the client may send the next piece
-            # of the same session while this one is still rendering.
-            with sessions_lock:
-                now = time.time()
-                for k in [k for k, (_, used) in sessions.items() if now - used > 600]:
-                    del sessions[k]
-                state = sessions.get(session, (None, 0))[0]
-            try:
-                frames = render(avatar, pcm, state)
-                while True:
-                    try:
-                        img = next(frames)
-                    except StopIteration as done:
-                        if session:
-                            with sessions_lock:
-                                sessions[session] = (done.value, time.time())
-                        break
-                    if box and (n or not want_key):
-                        x, y, w, h = box
-                        jpeg = cv2.imencode(".jpg", img[y : y + h, x : x + w], [cv2.IMWRITE_JPEG_QUALITY, PATCH_QUALITY])[1]
-                        send("P", struct.pack(">HH", x, y) + jpeg.tobytes())
-                    elif box:
-                        send("K", cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, KEY_QUALITY])[1].tobytes())
-                    else:
-                        if 0 < width < img.shape[1]:
-                            img = cv2.resize(img, (width, img.shape[0] * width // img.shape[1]), interpolation=cv2.INTER_AREA)
-                        send("F", cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])[1].tobytes())
-                    n += 1
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                log("client stopped")
-                return
-            except Exception as e:
-                error = str(e)
-                log("error:", error)
-        log(f"{avatar}: {len(pcm) / 32000:.1f}s audio, {n} frames in {time.time() - t:.1f}s")
+        timing = {"gpu": 0.0, "renderer": 0.0, "frames": 0}
+        out = queue.Queue()  # (kind, payload); ("gone"/"end", ...) last
+        cancel = threading.Event()  # the client stopped: stop rendering for it
+
+        def work():
+            # Renders under render_lock, while this handler thread sends frames as they come:
+            # a slow link (e.g. over Wi-Fi) delays only its own frames, never the GPU.
+            error = None
+            with render_lock:
+                # A client that gave up while waiting its turn (e.g. a late speech piece) would
+                # only waste the GPU: skip it.
+                if cancel.is_set() or client_gone(self.connection):
+                    return out.put(("gone", None))
+                g = time.time()
+                renderer_time.value = 0.0
+                # Read the motion state only once it's our turn: the client may send the next
+                # piece of the same session while this one is still rendering.
+                with sessions_lock:
+                    now = time.time()
+                    for k in [k for k, (_, used) in sessions.items() if now - used > 600]:
+                        del sessions[k]
+                    state = sessions.get(session, (None, 0))[0]
+                try:
+                    frames = render(avatar, pcm, state)
+                    n = 0
+                    while not cancel.is_set():
+                        try:
+                            img = next(frames)
+                        except StopIteration as done:
+                            if session:
+                                with sessions_lock:
+                                    sessions[session] = (done.value, time.time())
+                            break
+                        if box and (n or not want_key):
+                            x, y, w, h = box
+                            jpeg = cv2.imencode(".jpg", img[y : y + h, x : x + w], [cv2.IMWRITE_JPEG_QUALITY, PATCH_QUALITY])[1]
+                            out.put(("P", struct.pack(">HH", x, y) + jpeg.tobytes()))
+                        elif box:
+                            out.put(("K", cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, KEY_QUALITY])[1].tobytes()))
+                        else:
+                            if 0 < width < img.shape[1]:
+                                img = cv2.resize(img, (width, img.shape[0] * width // img.shape[1]), interpolation=cv2.INTER_AREA)
+                            out.put(("F", cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])[1].tobytes()))
+                        n += 1
+                    timing.update(gpu=time.time() - g, renderer=renderer_time.value, frames=n)
+                except Exception as e:
+                    error = str(e)
+                    log("error:", error)
+            out.put(("end", error))
+
+        threading.Thread(target=work, daemon=True).start()
         try:
-            send("E", json.dumps({"error": error}).encode())
-            self.wfile.write(b"0\r\n\r\n")
-        except OSError:
-            pass
+            while True:
+                kind, payload = out.get()
+                if kind == "gone":
+                    log("client gone before its turn")
+                    return
+                if kind == "end":
+                    send("E", json.dumps({"error": payload}).encode())
+                    self.wfile.write(b"0\r\n\r\n")
+                    break
+                send(kind, payload)
+        except (OSError, TimeoutError):
+            cancel.set()
+            log("client stopped")
+            return
+        log(
+            f"{avatar}: {len(pcm) / 32000:.1f}s audio, {timing['frames']} frames, GPU {timing['gpu']:.2f}s "
+            f"(renderer {timing['renderer']:.2f}s), total {time.time() - t:.2f}s"
+        )
 
 
 if __name__ == "__main__":

@@ -190,6 +190,42 @@ main {
   background: #11141c;
 }
 
+.demo-bot-mic {
+  position: absolute;
+  left: 16px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: min(240px, calc(100% - 32px));
+  padding: 8px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.demo-bot-mic select {
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: #262c3c;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+}
+
+.demo-bot-meter {
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+
+.demo-bot-meter > div {
+  height: 100%;
+  background: #4fd18b;
+  transition: width 0.1s linear;
+}
+
 .demo-bot-debug {
   position: absolute;
   top: 12px;

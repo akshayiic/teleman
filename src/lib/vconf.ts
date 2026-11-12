@@ -36,6 +36,7 @@ export class VConfCall {
   private socket: Socket | null = null;
   private sendTransport: types.Transport | null = null;
   private recvTransport: types.Transport | null = null;
+  private micProducer: types.Producer | null = null;
   private consumers = new Map<string, types.Consumer>();
   private peers = new Map<string, string>();
   private closed = false;
@@ -79,6 +80,28 @@ export class VConfCall {
         })
       );
     });
+  }
+
+  /** Switches the microphone being sent, without leaving the call. */
+  async replaceMicTrack(track: MediaStreamTrack) {
+    await this.micProducer?.replaceTrack({ track });
+  }
+
+  /** WebRTC's own view of a participant's incoming audio: total bytes and loudness (0..1), for diagnostics. */
+  async audioStats(peerId: string): Promise<{ bytes: number; level: number | null; paused: boolean } | null> {
+    for (const consumer of this.consumers.values()) {
+      if (consumer.kind !== "audio" || consumer.appData.peerId !== peerId) continue;
+      let bytes = 0;
+      let level: number | null = null;
+      (await consumer.getStats()).forEach((s) => {
+        if (s.type === "inbound-rtp") {
+          bytes = s.bytesReceived ?? 0;
+          level = s.audioLevel ?? null;
+        }
+      });
+      return { bytes, level, paused: consumer.paused };
+    }
+    return null;
   }
 
   close(reason = "Left the call.") {
@@ -142,7 +165,7 @@ export class VConfCall {
     const [audio] = stream.getAudioTracks();
     const [video] = stream.getVideoTracks();
     if (audio && device.canProduce("audio")) {
-      await this.sendTransport.produce({ track: audio, codecOptions: { opusStereo: true, opusDtx: true } });
+      this.micProducer = await this.sendTransport.produce({ track: audio, codecOptions: { opusStereo: true, opusDtx: true } });
     }
     if (video && device.canProduce("video")) {
       await this.sendTransport.produce({
@@ -181,9 +204,12 @@ export class VConfCall {
       case "peerDisplayNameChanged":
         this.peers.set(data.peerId, data.displayName);
         break;
-      case "kickedOutByModerator":
-        this.close("A moderator removed the agent from the call.");
+      case "kickedOutByModerator": {
+        console.log("[vconf] kickedOutByModerator", data);
+        const by = this.peers.get(data?.moderatorId) ?? data?.moderatorId;
+        this.close(`Removed from the call by ${by ? `moderator "${by}"` : "a moderator"}.`);
         return;
+      }
       case "consumerClosed": {
         const consumer = this.consumers.get(data.consumerId);
         if (consumer) {
@@ -194,7 +220,7 @@ export class VConfCall {
         return;
       }
       case "samePeerOverride":
-        this.close("The same agent joined from somewhere else.");
+        this.close("This link was opened somewhere else too, so this tab left the call.");
         return;
       // Media bookkeeping.
       case "producerScore":

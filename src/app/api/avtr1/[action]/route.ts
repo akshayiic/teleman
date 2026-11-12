@@ -19,6 +19,9 @@ async function forward(request: Request, action: string) {
       method: request.method,
       headers: { "X-Tunnel-Skip-AntiPhishing-Page": "true" },
       body: request.method === "POST" ? await request.arrayBuffer() : undefined,
+      // When the browser gives up on a render, drop it on the bridge too, or the bridge
+      // keeps writing frames nobody reads while holding its one-render-at-a-time GPU lock.
+      signal: request.signal,
     });
     return new Response(res.body, {
       status: res.status,
