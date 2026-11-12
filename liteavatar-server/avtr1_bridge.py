@@ -15,10 +15,14 @@ Only needs numpy and OpenCV (both in the renderer's pixi environment).
 
     GET  /health?avatar=<id>        {"ready": true, "avatars": [...]} or 503 {"error": ...}
     GET  /idle.webm?avatar=<id>     ~6 s of the avatar idling (rendered from silence, cached)
-    POST /render?avatar=<id>&session=<id>   body: int16 16 kHz mono PCM
+    POST /render?avatar=<id>&session=<id>[&width=<px>][&patch=1[&key=0]]   body: int16 16 kHz mono PCM
          -> stream of messages, 1 byte type + 4 byte big-endian length + payload:
             'F' one frame (JPEG), 'E' end (JSON: error message, if any)
          Calls with the same session continue the motion of the previous call.
+         patch=1 (for slow links): only the face moves, so the first frame comes as 'K'
+         (full JPEG) and the rest as 'P' (2+2 byte big-endian x, y, then a JPEG of the
+         face region to draw over 'K' at x, y): ~5x less data at full resolution. With key=0
+         every frame is a 'P', for a client that keeps one 'K' as its fixed background.
 
 Environment: AVTR1_RENDERER (default http://127.0.0.1:8000), AVTR1_BG (background id,
 default: the renderer's first), BRIDGE_PORT (default 8770).
@@ -45,12 +49,15 @@ FPS = 25
 CURRENT = 3200  # samples per call: 5 frames x 640 (renderer's chunk_size x frame_len)
 FUTURE = 3280  # look-ahead samples per call: 5 x 640 + 80 audio shift
 IDLE_SECONDS = 6
-JPEG_QUALITY = 85
+JPEG_QUALITY = 75  # ~115 KB per 720p frame; live lip sync streams 25 a second
 
 sessions = {}  # session id -> (state blob, last used); motion continues across sentences
 sessions_lock = threading.Lock()
 render_lock = threading.Lock()  # one GPU, one stream at a time
 idle_clips = {}
+face_boxes = {}  # avatar -> (x, y, w, h) of the region AVTR-1 changes, for patch=1
+PATCH_QUALITY = 90
+KEY_QUALITY = 92  # the background a client may keep for a whole call
 
 
 def log(*args):
@@ -136,6 +143,27 @@ def idle_clip(avatar):
     return idle_clips[avatar]
 
 
+def face_box(avatar):
+    """The part of the frame that moves (face and head), measured once per avatar from a
+    few seconds of speech-like audio, with a margin for bigger head movements."""
+    if avatar not in face_boxes:
+        rng = np.random.default_rng(0)
+        t = np.arange(16000 * 3) / 16000
+        pcm = (np.sin(2 * np.pi * 180 * t) * (0.5 + 0.5 * np.sin(2 * np.pi * 3 * t)) * 9000 + rng.normal(0, 800, t.size))
+        with render_lock:
+            stack = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).astype(np.float32) for f in render(avatar, pcm.astype(np.int16).tobytes())])
+        moving = (cv2.GaussianBlur(stack.max(0) - stack.min(0), (0, 0), 3) > 18).astype(np.uint8)
+        _, _, stats, _ = cv2.connectedComponentsWithStats(moving)
+        x, y, w, h = stats[1 + np.argmax(stats[1:, cv2.CC_STAT_AREA]), :4]
+        H, W = stack.shape[1:]
+        cx, cy, w, h = x + w / 2, y + h / 2, w * 2 + 48, h * 2 + 48
+        x0, y0 = max(0, int(cx - w / 2)) // 8 * 8, max(0, int(cy - h / 2)) // 8 * 8
+        x1, y1 = min(W, int(cx + w / 2 + 7) // 8 * 8), min(H, int(cy + h / 2 + 7) // 8 * 8)
+        face_boxes[avatar] = (x0, y0, x1 - x0, y1 - y0)
+        log(f"{avatar}: face region {face_boxes[avatar]} of {W}x{H}")
+    return face_boxes[avatar]
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -184,6 +212,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(404, {"error": "not found"})
         q = parse_qs(url.query)
         avatar, session = q.get("avatar", [""])[0], q.get("session", [""])[0]
+        width = int(q.get("width", ["0"])[0] or 0)  # optional smaller frames, for slow links
+        try:
+            box = face_box(avatar) if q.get("patch", [""])[0] == "1" else None
+            want_key = q.get("key", ["1"])[0] != "0"
+        except Exception as e:
+            return self.send_json(502, {"error": f"AVTR-1: {e}"})
         pcm = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         pcm = pcm[: len(pcm) // 2 * 2]
 
@@ -199,13 +233,15 @@ class Handler(BaseHTTPRequestHandler):
 
         error = None
         t = time.time()
-        with sessions_lock:
-            now = time.time()
-            for k in [k for k, (_, used) in sessions.items() if now - used > 600]:
-                del sessions[k]
-            state = sessions.get(session, (None, 0))[0]
         n = 0
         with render_lock:
+            # Read the motion state only once it's our turn: the client may send the next piece
+            # of the same session while this one is still rendering.
+            with sessions_lock:
+                now = time.time()
+                for k in [k for k, (_, used) in sessions.items() if now - used > 600]:
+                    del sessions[k]
+                state = sessions.get(session, (None, 0))[0]
             try:
                 frames = render(avatar, pcm, state)
                 while True:
@@ -216,7 +252,16 @@ class Handler(BaseHTTPRequestHandler):
                             with sessions_lock:
                                 sessions[session] = (done.value, time.time())
                         break
-                    send("F", cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])[1].tobytes())
+                    if box and (n or not want_key):
+                        x, y, w, h = box
+                        jpeg = cv2.imencode(".jpg", img[y : y + h, x : x + w], [cv2.IMWRITE_JPEG_QUALITY, PATCH_QUALITY])[1]
+                        send("P", struct.pack(">HH", x, y) + jpeg.tobytes())
+                    elif box:
+                        send("K", cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, KEY_QUALITY])[1].tobytes())
+                    else:
+                        if 0 < width < img.shape[1]:
+                            img = cv2.resize(img, (width, img.shape[0] * width // img.shape[1]), interpolation=cv2.INTER_AREA)
+                        send("F", cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])[1].tobytes())
                     n += 1
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 log("client stopped")

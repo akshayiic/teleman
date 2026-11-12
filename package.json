@@ -6,17 +6,29 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "liteavatar": "liteavatar-server\\vendor\\venv\\Scripts\\python.exe liteavatar-server/server.py"
   },
   "dependencies": {
+    "@daily-co/daily-js": "^0.94.0",
+    "@grpc/grpc-js": "^1.14.7",
+    "@grpc/proto-loader": "^0.8.1",
+    "@met4citizen/headaudio": "^1.0.0",
+    "@met4citizen/talkinghead": "^1.8.2",
+    "@react-three/drei": "^10.7.9",
+    "@react-three/fiber": "^9.8.2",
+    "mediasoup-client": "^3.26.0",
     "next": "16.4.3",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "socket.io-client": "^4.8.4",
+    "three": "^0.186.1"
   },
   "devDependencies": {
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/three": "^0.186.0",
     "eslint": "^9",
     "eslint-config-next": "16.4.3",
     "typescript": "^5"

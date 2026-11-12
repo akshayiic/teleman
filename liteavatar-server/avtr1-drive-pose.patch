@@ -1,0 +1,151 @@
+diff --git a/src/avtr1_renderer/avatar_loader.py b/src/avtr1_renderer/avatar_loader.py
+index e2732bc..fa0d95e 100644
+--- a/src/avtr1_renderer/avatar_loader.py
++++ b/src/avtr1_renderer/avatar_loader.py
+@@ -28,7 +28,8 @@ source crop).
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
++import json
++from dataclasses import dataclass, replace
+ from pathlib import Path
+ 
+ import cv2
+@@ -37,7 +38,7 @@ import torch
+ 
+ from avtr1_renderer.components.face_detection import detect_faces
+ from avtr1_renderer.components.face_landmarks import landmark106, landmark203
+-from avtr1_renderer.components.liveportrait.motion_extractor import extract_motion
++from avtr1_renderer.components.liveportrait.motion_extractor import _get_rotation_matrix, extract_motion
+ from avtr1_renderer.components.source_crop import crop_image, get_default_mask
+ from avtr1_renderer.models.appearance_extractor import (
+     AEInput,
+@@ -87,6 +88,13 @@ class Avatar:
+     mask: torch.Tensor  # (1, H, W)           pasteback mask (pre-warped)
+     source: torch.Tensor  # (3, H, W)         source frame RGB in [0, 1] (grey-bg or original-bg)
+     no_matting: bool = False  # skip MODNet; source carries the real background
++    # Pose/expression the motion is driven from, when ``<stem>.pose.json`` adjusts the
++    # portrait's (e.g. a tilted head or a broad smile); the portrait stays the source.
++    kp_drive: KPInfo | None = None
++
++    @property
++    def drive(self) -> KPInfo:
++        return self.kp_info if self.kp_drive is None else self.kp_drive
+ 
+ 
+ @dataclass(slots=True, frozen=True)
+@@ -430,7 +438,34 @@ class AvatarLoader:
+             mask=mask,
+             source=source_t,
+             no_matting=no_matting,
++            kp_drive=_drive_pose(portrait_path, kp_info),
+         )
+ 
+ 
++def _drive_pose(portrait_path: Path, kp_info: KPInfo) -> KPInfo | None:
++    """Optional ``<stem>.pose.json`` next to the portrait, e.g. ``{"roll": 0, "expression": 0.6}``:
++    ``pitch``/``yaw``/``roll`` replace the portrait's head angles (degrees; 0 = facing the
++    camera, upright), ``expression`` scales its expression (1 = as photographed, 0 = neutral).
++    """
++    path = Path(portrait_path).parent / f"{Path(portrait_path).stem}.pose.json"
++    if not path.is_file():
++        return None
++    cfg = json.loads(path.read_text())
++    angles = {
++        k: torch.full_like(getattr(kp_info, k), float(cfg[k])) if k in cfg else getattr(kp_info, k)
++        for k in ("pitch", "yaw", "roll")
++    }
++    print(
++        f"{path.name}: pitch/yaw/roll {[round(float(getattr(kp_info, k)), 1) for k in angles]} -> "
++        f"{[round(float(v), 1) for v in angles.values()]}, expression x{cfg.get('expression', 1.0)}",
++        flush=True,
++    )
++    return replace(
++        kp_info,
++        **angles,
++        R=_get_rotation_matrix(angles["pitch"], angles["yaw"], angles["roll"]),
++        exp=kp_info.exp * float(cfg.get("expression", 1.0)),
++    )
++
++
+ __all__ = ["Avatar", "AvatarLoader", "CropConfig"]
+diff --git a/src/avtr1_renderer/avtr1_motion_generator.py b/src/avtr1_renderer/avtr1_motion_generator.py
+index d2aca4f..b5a7c2a 100644
+--- a/src/avtr1_renderer/avtr1_motion_generator.py
++++ b/src/avtr1_renderer/avtr1_motion_generator.py
+@@ -342,10 +342,10 @@ class AVTR1MotionGenerator:
+         device = torch.device("cuda")
+         # Tile the avatar's normalised neutral motion across past_size frames.
+         with torch.no_grad():
+-            so3 = roma.rotmat_to_rotvec(avatar.kp_info.R)  # (1, 3)
++            so3 = roma.rotmat_to_rotvec(avatar.drive.R)  # (1, 3)
+             so3_n = (so3 - self._normalizer.offset_so3) / self._normalizer.scale_so3
+ 
+-            exp_in_R = avatar.kp_info.exp @ avatar.kp_info.R.transpose(-1, -2)  # (1, 21, 3)
++            exp_in_R = avatar.drive.exp @ avatar.drive.R.transpose(-1, -2)  # (1, 21, 3)
+             exp_n = (exp_in_R - self._normalizer.offset_exp) / self._normalizer.scale_exp
+             exp_n = exp_n.clamp(-Z_SCORE_CLIP_VALUE, Z_SCORE_CLIP_VALUE)
+             exp_lipsync_n = exp_n.view(1, -1)[:, self._lipsync_index]  # (1, N_LIPSYNC)
+@@ -523,14 +523,14 @@ class AVTR1MotionGenerator:
+ 
+     def _build_kp_cond(self, avatar: Avatar) -> torch.Tensor:
+         """Build the avatar's normalised kp_cond ``(1, 1, 129)`` tensor."""
+-        R = avatar.kp_info.R
++        R = avatar.drive.R
+         so3 = roma.rotmat_to_rotvec(R)
+         so3_n = (so3 - self._normalizer.offset_so3) / self._normalizer.scale_so3
+ 
+-        kp_n = (avatar.kp_info.kp - self._normalizer.offset_kp) / self._normalizer.scale_kp
++        kp_n = (avatar.drive.kp - self._normalizer.offset_kp) / self._normalizer.scale_kp
+         kp_n = kp_n.clamp(-Z_SCORE_CLIP_VALUE, Z_SCORE_CLIP_VALUE)
+ 
+-        exp_in_R = avatar.kp_info.exp @ R.transpose(-1, -2)
++        exp_in_R = avatar.drive.exp @ R.transpose(-1, -2)
+         exp_n = (exp_in_R - self._normalizer.offset_exp) / self._normalizer.scale_exp
+         exp_n = exp_n.clamp(-Z_SCORE_CLIP_VALUE, Z_SCORE_CLIP_VALUE)
+ 
+diff --git a/src/avtr1_renderer/components/liveportrait/motion_stitch.py b/src/avtr1_renderer/components/liveportrait/motion_stitch.py
+index 53b4ca8..ff6d2c0 100644
+--- a/src/avtr1_renderer/components/liveportrait/motion_stitch.py
++++ b/src/avtr1_renderer/components/liveportrait/motion_stitch.py
+@@ -143,6 +143,7 @@ def motion_stitch(
+     motions: MotionFrame,
+     *,
+     stitch: StitchEngine,
++    kp_drive: KPInfo | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Return ``(x_s, x_d)`` keypoint pairs ready for the warp network.
+ 
+@@ -171,7 +172,8 @@ def motion_stitch(
+     Tests that want the pre-stitch math can call ``_transform_source`` /
+     ``_build_x_d_delta`` / ``_transform_driving`` directly.
+     """
+-    x_d_delta = _build_x_d_delta(motions, kp_info)
++    # Expression outside the lipsync coords comes from the driving pose (Avatar.drive).
++    x_d_delta = _build_x_d_delta(motions, kp_info if kp_drive is None else kp_drive)
+     x_d_raw = _transform_driving(x_d_delta, motions.R, kp_info)
+     x_s = _transform_source(kp_info)
+ 
+diff --git a/src/avtr1_renderer/renderer.py b/src/avtr1_renderer/renderer.py
+index 72a392f..6398225 100644
+--- a/src/avtr1_renderer/renderer.py
++++ b/src/avtr1_renderer/renderer.py
+@@ -58,7 +58,7 @@ def render_chunk_streaming(
+     with a per-frame ``pack_frames`` + H2D copy.
+     """
+     n = len(motions)
+-    x_s, x_d_all = motion_stitch(avatar.kp_info, motions, stitch=stitch)
++    x_s, x_d_all = motion_stitch(avatar.kp_info, motions, stitch=stitch, kp_drive=avatar.kp_drive)
+     f_s_b = avatar.f_s.expand(n, -1, -1, -1, -1).contiguous()
+     x_s_b = x_s.expand_as(x_d_all).contiguous()
+     warped = warp(
+@@ -113,7 +113,7 @@ def render_chunk(
+     """
+     n = len(motions)
+     # Batched: x_s is (1, 21, 3), x_d_all is (N, 21, 3).
+-    x_s, x_d_all = motion_stitch(avatar.kp_info, motions, stitch=stitch)
++    x_s, x_d_all = motion_stitch(avatar.kp_info, motions, stitch=stitch, kp_drive=avatar.kp_drive)
+     f_s_b = avatar.f_s.expand(n, -1, -1, -1, -1).contiguous()
+     x_s_b = x_s.expand_as(x_d_all).contiguous()
+     warped = warp(

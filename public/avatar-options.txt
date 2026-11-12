@@ -1,0 +1,145 @@
+TELEMAN - AVATAR OPTIONS: PRICING, STRENGTHS AND LIMITATIONS
+=============================================================
+Prices checked on 2026-11-02. Several come from third-party price trackers,
+so confirm them on the vendor pages before relying on them.
+
+
+1. PRICING AT A GLANCE
+----------------------
+
+ # | Option (dropdown)              | How it works                                   | Cost to run                                 | Commercial use?
+---+--------------------------------+------------------------------------------------+---------------------------------------------+-------------------------------
+ 1 | Tavus: Anna, Daniel            | Tavus cloud video (CVI, echo mode) over        | ~$0.26-0.35 per connected minute            | Yes, on a paid plan
+   | (real, live)                   | WebRTC (Daily)                                 | (~$16-21 per hour)                          |
+ 2 | Local: Priya, Kavya            | LiteAvatar + Piper voice on this PC's CPU      | Free (own hardware)                         | Code MIT; check gallery face licence
+ 3 | Your photo: Priti              | LivePortrait mouth atlas + Piper on the CPU    | Free                                        | Mostly (see limitations)
+ 4 | Priti HD (AVTR-1)              | AVTR-1 on a Linux NVIDIA GPU via bridge+tunnel | Software free; rented RTX 4090              | NO - non-commercial licence
+   |                                |                                                | ~$0.14-0.89 per hour, or own GPU            |
+ 5 | 3D: Michael, Arjun, Kavita     | TalkingHead + Kokoro voice (HeadTTS) in the    | Free to run; avatar licence for commercial  | Code/voice yes (MIT/Apache);
+   |                                | browser                                        | use (see below)                             | current avatar files non-commercial
+ 6 | Audio2Face: Lito, Stan Lee     | NVIDIA Audio2Face-3D cloud API drives the face | Trial credits only; hosted API deprecated.  | Only with NVIDIA licence
+   | (in code, not in dropdown)     | from speech audio                              | Self-host needs NVIDIA GPU + AI Enterprise  |
+
+
+Tavus plans
+-----------
+ Plan       | Price/month | Conversation minutes included | Extra minute
+------------+-------------+-------------------------------+-------------
+ Free       | $0          | a few test minutes            | -
+ Starter    | $22         | ~60                           | none listed (calls capped at 10 min)
+ Builder    | $59         | included allowance            | $0.35
+ Growth     | $397        | 1,300                         | $0.31
+ Business   | $975        | included allowance            | $0.26
+ Enterprise | custom      | custom                        | custom
+
+Billed in 6-second steps, 30-second minimum per conversation. Silent time while
+connected is billed too, which is why TavusLive.tsx disconnects after 30 s of silence.
+
+Avatar licences for option 5
+----------------------------
+ - Avatar SDK (MetaPerson), used for Michael: Pro plan $800/month; Enterprise on quote.
+ - Arjun: "Indian Man in suit" by Pixel_Monster, Sketchfab, CC BY 4.0 (commercial OK with credit).
+ - Kavita: "Indian Woman in Saree" by Pixel_Monster, Sketchfab Standard licence.
+ - Their face shapes are copied from Michael (MetaPerson), so that part stays non-commercial.
+ - Free alternative: any GLB with ARKit + Oculus viseme blend shapes that is
+   licensed for commercial use.
+
+
+2. STRENGTHS AND LIMITATIONS
+----------------------------
+
+[1] TAVUS - Anna, Daniel
+  Strengths
+   + Most realistic: real human video, natural head/eye/expression movement
+   + Speaks within ~1 s, any text length
+   + Nothing runs locally; works on any device
+   + Commercial-ready with SLA; many stock faces, custom face cloning available
+  Limitations
+   - Highest running cost (1 h/day at ~$0.31/min = ~$560/month)
+   - Concurrency limits; one Daily call at a time in the browser
+   - Few seconds to connect on first Speak
+   - Depends on Tavus servers and pricing (changed several times in 2026)
+   - Voice quality and languages depend on Tavus's TTS
+
+[2] LOCAL - Priya, Kavya (LiteAvatar + Piper)
+  Strengths
+   + Free and unlimited, fully offline and private
+   + Faces trained from video: mouth shape follows each sound
+   + English and Hindi (Devanagari text auto-detected as Hindi)
+  Limitations
+   - Only the downloaded gallery faces; no custom face without training
+   - CPU-heavy: ~12-14 fps sustained, long texts take up to ~2x spoken length
+   - Only the face moves; head and body stay still
+   - Heavy setup: ~3 GB vendor folder + Python 3.10 environment
+   - One face in memory at a time (~1 GB), ~4 s to switch
+   - One user per machine; not built to handle many users
+   - Piper voices sound more robotic than Tavus or Kokoro
+
+[3] YOUR PHOTO - Priti (LivePortrait + Piper)
+  Strengths
+   + Any front-facing photo becomes a presenter; free and offline
+   + Light at speaking time (cross-fades pre-rendered mouth images)
+  Limitations
+   - Least realistic photo-real option: 7 loudness-driven mouth levels,
+     mouth shapes don't match individual sounds, face and head barely move
+   - ~2 min to prepare each new photo (cached afterwards)
+   - Needs a front-facing photo with the mouth visible
+   - LivePortrait is MIT, but some original releases depend on non-commercial
+     InsightFace models; check the files actually used
+
+[4] PRITI HD (AVTR-1 on GPU)
+  Strengths
+   + Photo animated with head movement and expressions; close to Tavus quality
+   + No per-minute fee, only GPU cost
+  Limitations
+   - NON-COMMERCIAL licence: cannot go into a product
+   - Needs Linux + NVIDIA RTX 20-series or newer (real time from ~RTX 3060 Ti)
+   - Renderer, bridge and tunnel must all be up; any one can fail
+   - Few seconds of warm-up; buffers when rendering is below real time
+
+[5] 3D AVATARS - Michael, Arjun, Kavita (TalkingHead + Kokoro)
+  Strengths
+   + Instant start, no cost per use, runs in the browser; scales to any number of users
+   + Accurate lip-sync from Kokoro's timing for each mouth shape
+   + Good-sounding Kokoro voices (US, UK and Hindi-accent voices)
+   + Idle motion, eye contact, blinking, gestures, moods
+  Limitations
+   - Clearly 3D/CG, not real video
+   - Current avatar files are non-commercial (~$800/month or your own model)
+   - Needs WebGPU for good speed (slower WASM fallback); first load downloads
+     the voice model (~100-300 MB)
+   - English text only (Hindi-accent voices read English; no Devanagari)
+
+[6] AUDIO2FACE - Lito, Stan Lee (inactive)
+  Strengths
+   + High-quality facial animation from any audio, full ARKit blend shapes + emotion
+  Limitations
+   - NVIDIA's hosted API is deprecated; free trial credits run out
+   - Self-hosting needs NVIDIA GPU + AI Enterprise licence (no published price found)
+   - Lito is an unrigged scan (jaw faked in a shader); a Stan Lee likeness
+     raises likeness/publicity-rights issues for public use
+   - Maximum audio length per request; corporate TLS certificate issue on this network
+
+
+3. WHICH TO USE WHEN
+--------------------
+ Most realistic, commercial, budget available  -> Tavus (Growth works out to ~$0.31/min)
+ Free, private, real-looking, English/Hindi    -> Priya / Kavya (local)
+ Custom face, free                             -> Priti; Priti HD for demos/internal only
+ Many users at once, zero cost per use, instant -> 3D Michael / Arjun / Kavita, after replacing the
+                                                 avatars with commercially licensed ones
+
+
+SOURCES
+-------
+ https://www.tavus.io/pricing
+ https://www.costbench.com/software/ai-video-generators/tavus/
+ https://usagepricing.com/blueprint/tavus
+ https://www.usagepricing.com/blueprint/activity/tavus-2026-10-24-conversation-duration-caps
+ https://avatarsdk.com/pricing-cloud/
+ https://costbench.com/software/ai-3d-generation/avaturn/hidden-costs/
+ https://build.nvidia.com/nvidia/audio2face-3d
+ https://forums.developer.nvidia.com/t/nim-api-credits/305703/25
+ https://www.stork.ai/blog/runpod-alternatives-gpu-cloud-2026
+ https://www.hostinger.com/tutorials/?p=158956
+ https://www.hackceleration.com/labs/runpod-pricing

@@ -3,7 +3,8 @@
 Free, unlimited, photoreal talking presenter rendered on this PC's CPU:
 
 - **Voice:** [Piper](https://github.com/OHF-Voice/piper1-gpl), offline: English `en_US-lessac-medium`,
-  Hindi `hi_IN-priyamvada-medium`. Without an explicit language, text with Devanagari is read in Hindi.
+  Hindi `hi_IN-priyamvada-medium`; faces in `MALE_FACES` (Sahil) use `en_US-ryan-high` and
+  `hi_IN-pratham-medium`. Without an explicit language, text with Devanagari is read in Hindi.
 - **Photo faces ("priti"):** any still portrait listed in `PHOTOS` in `server.py`
   (`public/avatars/priya.png`). [LivePortrait](https://github.com/KwaiVGI/LivePortrait) (MIT) is
   far too slow on this CPU to run live (~13 s/frame), so `portrait_avatar.py` uses it once per photo
@@ -83,6 +84,13 @@ curl -L -o voices/en_US-lessac-medium.onnx.json $V/en_US-lessac-medium.onnx.json
 V=https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/priyamvada/medium
 curl -L -o voices/hi_IN-priyamvada-medium.onnx $V/hi_IN-priyamvada-medium.onnx
 curl -L -o voices/hi_IN-priyamvada-medium.onnx.json $V/hi_IN-priyamvada-medium.onnx.json
+# Men's voices
+V=https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high
+curl -L -o voices/en_US-ryan-high.onnx $V/en_US-ryan-high.onnx
+curl -L -o voices/en_US-ryan-high.onnx.json $V/en_US-ryan-high.onnx.json
+V=https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/pratham/medium
+curl -L -o voices/hi_IN-pratham-medium.onnx $V/hi_IN-pratham-medium.onnx
+curl -L -o voices/hi_IN-pratham-medium.onnx.json $V/hi_IN-pratham-medium.onnx.json
 
 # LivePortrait ONNX models, for photo faces (the server converts the warping model to a
 # CPU-compatible copy, warping_spade_cpu.onnx, on first use; needs the onnx package)
@@ -130,6 +138,26 @@ script makes a transparent cut-out framed like the built-in avatars (e.g. `maria
 shown over the `AVTR1_BG` backdrop from `start-avtr1.sh` (default `minimal_office`; the
 renderer's `/avatars` lists the others). Either way, lip sync is best from a front-facing
 photo with a neutral expression and closed mouth.
+
+AVTR-1 drives the face from the photo's own head pose and expression, so a tilted head or a
+broad smile stays for the whole video. `avtr1-drive-pose.patch` (apply in the avtr-1 checkout
+with `git apply`) adds an optional `<avatar>.pose.json` next to the portrait in
+`reference_frames/` that drives the motion from a corrected pose while the photo stays the
+source: `pitch`/`yaw`/`roll` in degrees (0 = upright, facing the camera) and `expression`
+(1 = as photographed, 0 = neutral). Aditi uses [aditi.pose.json](aditi.pose.json)
+(head straight, smile softened to 0.6) and Sahil [sahil.pose.json](sahil.pose.json)
+(head straight, expression 0.8); the renderer logs the photo's angles on start.
+Restart the renderer after changing it.
+
+### Agent in video calls (V-Retail conference)
+
+The call panel under the local presenters puts the presenter (e.g. Priti HD or Aditi HD)
+into a V-Retail conference call as the agent: you paste the agent's JWT, and it joins over
+socket.io like the [vretail-conference](https://github.com/inkincaps/conference-front/tree/vretail-conference)
+client (`backend-1.conference.svc.inkincaps.com`, path `/v-conference`; override with
+`NEXT_PUBLIC_VCONF_SERVER`), publishing the presenter's video and voice. The backend runs the
+conversation: any socket notification carrying `text` is spoken by the presenter, and the
+panel lists the backend's other messages (`src/components/CallPanel.tsx`, `src/lib/vconf.ts`).
 
 The renderer logs a "Keep alive loop iteration failed" traceback every ~30 s because it
 looks for AVTR-1's cloud load balancer; it doesn't affect rendering.
